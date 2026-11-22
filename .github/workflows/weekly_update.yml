@@ -1,0 +1,43 @@
+name: Weekly KRX Stock Data Update
+
+on:
+  schedule:
+    # 매주 월요일 한국시간 오전 9시 (GitHub은 UTC 기준이므로 월요일 00:00)
+    - cron: '0 0 * * 1'
+  workflow_dispatch:  # GitHub 웹에서 버튼 클릭으로 즉시 테스트 실행 가능
+
+permissions:
+  contents: write     # 업데이트된 DB 파일을 리포지토리에 저장할 권한
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 코드 불러오기
+        uses: actions/checkout@v4
+
+      - name: 2. Python 3.12 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 3. 라이브러리 설치
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. 데이터 수집 스크립트 실행
+        env:
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+        run: |
+          python main.py --days 10
+
+      - name: 5. 업데이트된 DB 자동 저장 (Commit & Push)
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add kr_quant.db
+          git diff --staged --quiet || git commit -m "chore: weekly stock data update"
+          git push
