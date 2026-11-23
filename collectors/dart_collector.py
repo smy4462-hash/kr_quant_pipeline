@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 
@@ -25,53 +26,66 @@ def _parse_int(val):
         return 0
     return int(str(val).replace(",", "").strip())
 
+def _split_date_chunks(start_date: str, end_date: str, chunk_days: int = 89):
+    """OpenDART 전체 공시 3개월 제한을 우회하기 위해 기간을 90일 이내 단위로 분할"""
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    chunks = []
+    curr = start_dt
+    while curr <= end_dt:
+        chunk_end = min(curr + timedelta(days=chunk_days), end_dt)
+        chunks.append((curr.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
+        curr = chunk_end + timedelta(days=1)
+    return chunks
+
 def fetch_disclosures(target_tickers, start_date, end_date):
     """
-    코스피 공시 일괄 조회 후 필터링.
-    반환값: (공시 레코드 리스트, 자사주취득 상세 조회 대상 {corp_code: ticker})
+    지정 기간을 90일 단위로 자동 분할해 코스피 공시를 일괄 조회한 뒤
+    target_tickers 및 핵심 키워드만 필터링하여 반환
     """
     api_key = os.getenv("DART_API_KEY")
     if not api_key:
         raise ValueError(".env 파일에 DART_API_KEY가 설정되어 있지 않습니다.")
 
-    bgn_de = start_date.replace("-", "")
-    end_de = end_date.replace("-", "")
-
+    chunks = _split_date_chunks(start_date, end_date)
     all_rows = []
-    page_no = 1
 
-    while True:
-        params = {
-            "crtfc_key": api_key,
-            "bgn_de": bgn_de,
-            "end_de": end_de,
-            "corp_cls": "Y",
-            "page_no": page_no,
-            "page_count": 100,
-        }
-        resp = requests.get(DART_LIST_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+    for idx, (bgn_de, end_de) in enumerate(chunks, start=1):
+        print(f"  [공시 구간 {idx}/{len(chunks)}] {bgn_de} ~ {end_de} 조회 중...")
+        page_no = 1
+        while True:
+            params = {
+                "crtfc_key": api_key,
+                "bgn_de": bgn_de,
+                "end_de": end_de,
+                "corp_cls": "Y",
+                "page_no": page_no,
+                "page_count": 100,
+            }
+            resp = requests.get(DART_LIST_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
 
-        status = data.get("status")
-        if status == "013":
-            break
-        if status != "000":
-            raise RuntimeError(f"OpenDART API 오류 ({status}): {data.get('message')}")
+            status = data.get("status")
+            if status == "013":
+                break
+            if status != "000":
+                raise RuntimeError(f"OpenDART API 오류 ({status}): {data.get('message')}")
 
-        all_rows.extend(data.get("list", []))
+            all_rows.extend(data.get("list", []))
 
-        total_page = int(data.get("total_page", 1))
-        if page_no >= total_page:
-            break
+            total_page = int(data.get("total_page", 1))
+            if page_no >= total_page:
+                break
 
-        page_no += 1
-        time.sleep(0.1)
+            page_no += 1
+            time.sleep(0.1)
 
     if not all_rows:
         return [], {}
 
-    df = pd.DataFrame(all_rows)
+    df = pd.DataFrame(all_rows).drop_duplicates(subset=["rcept_no"])
 
     # 1. 코스피200 종목만 필터링
     ticker_set = set(target_tickers)
@@ -109,7 +123,8 @@ def fetch_buyback_details(corp_ticker_map, start_date, end_date):
     end_de = end_date.replace("-", "")
 
     detail_records = []
-    for corp_code, ticker in corp_ticker_map.items():
+    total = len(corp_ticker_map)
+    for idx, (corp_code, ticker) in enumerate(corp_ticker_map.items(), start=1):
         params = {
             "crtfc_key": api_key,
             "corp_code": corp_code,
@@ -129,14 +144,16 @@ def fetch_buyback_details(corp_ticker_map, start_date, end_date):
                     item.get("rcept_no"),
                     ticker,
                     item.get("corp_name"),
-                    item.get("bddd"),                            # 이사회결의일
-                    _parse_int(item.get("aqpln_stk_ostk")),      # 취득예정 보통주식수
-                    _parse_int(item.get("aqpln_prc_ostk")),      # 취득예정 보통주금액(원)
-                    item.get("aqexpd_bgd"),                      # 취득예상 시작일
-                    item.get("aqexpd_edd"),                      # 취득예상 종료일
-                    item.get("aq_pp"),                           # 취득목적
-                    item.get("aq_mth"),                          # 취득방법
+                    item.get("bddd"),
+                    _parse_int(item.get("aqpln_stk_ostk")),
+                    _parse_int(item.get("aqpln_prc_ostk")),
+                    item.get("aqexpd_bgd"),
+                    item.get("aqexpd_edd"),
+                    item.get("aq_pp"),
+                    item.get("aq_mth"),
                 ])
+            if idx % 10 == 0 or idx == total:
+                print(f"  [자사주 상세 진행률] {idx}/{total}개 종목 완료")
         except Exception as e:
             print(f"  [경고] 자사주 상세 조회 실패 ({ticker}): {e}")
 
