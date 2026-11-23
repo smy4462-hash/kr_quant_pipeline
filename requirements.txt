@@ -2,3 +2,4 @@ pykrx
 pandas
 python-dotenv
 setuptools<81
+requests
