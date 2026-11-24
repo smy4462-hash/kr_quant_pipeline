@@ -280,6 +280,11 @@ def main():
     ohlcv, mkt_df = prepare_market_metrics(ohlcv_raw)
     ev_df, timeline_df = run_event_study(ohlcv, mkt_df, disc)
 
+    # 유동성 필터 통일 (regime_event_study.py와 동일: 직전 5일 평균 일거래대금 10억 원 이상)
+    before_cnt = len(ev_df)
+    ev_df = ev_df[ev_df["prev_5d_val"] >= MIN_DAILY_VAL].copy()
+    print(f"[유동성 필터] 일거래대금 {MIN_DAILY_VAL / 1e8:.0f}억 미만 {before_cnt - len(ev_df):,}건 제외 (유효 표본 {len(ev_df):,}건)")
+    
     # 1. 세분화 이벤트별 갭 & 시장중립 수익 분해
     summary = calc_decomposition_summary(ev_df)
     print("\n================ [1] 공시 세분화 & 알파 분해 (오버나잇 갭 vs 시장중립 실전수익) ================")

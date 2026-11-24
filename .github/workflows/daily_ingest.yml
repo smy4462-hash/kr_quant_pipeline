@@ -28,12 +28,14 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 4. 일간 증분 데이터 수집 (주가 · 공시 · 심리지표)
+      - name: 4. 일간 증분 데이터 수집 (주가 · 공시 · 심리지표 · KRX 파생)
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: |
           python main.py --mode all --days 5
           python collectors/sentiment_collector.py --days 2000
+          python collectors/krx_deriv_collector.py
 
       - name: 5. DB 변경사항 자동 저장 (Commit & Push)
         run: |

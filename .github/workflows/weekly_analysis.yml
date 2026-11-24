@@ -28,12 +28,14 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 4. 주간 누락 보정 수집 (최근 10일)
+      - name: 4. 주간 누락 보정 수집 (최근 10일 + KRX 파생)
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: |
           python main.py --mode all --days 10
           python collectors/sentiment_collector.py --days 2000
+          python collectors/krx_deriv_collector.py
 
       - name: 5. 이벤트 스터디 · 국면 분석 · 자동 해석 리포트 생성
         run: |

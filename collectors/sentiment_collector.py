@@ -87,7 +87,14 @@ def build_and_save_sentiment(days: int = 800):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.executemany(
-        "INSERT OR REPLACE INTO market_sentiment (date, vix, kr_hv20, usd_krw) VALUES (?, ?, ?, ?)",
+        """
+        INSERT INTO market_sentiment (date, vix, kr_hv20, usd_krw)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            vix = excluded.vix,
+            kr_hv20 = excluded.kr_hv20,
+            usd_krw = excluded.usd_krw
+        """,
         records,
     )
     conn.commit()
