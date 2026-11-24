@@ -1,0 +1,50 @@
+name: Weekly Quant Analysis & Report
+
+on:
+  schedule:
+    # 매주 월요일 한국시간 오전 8:30 (UTC 일요일 23:30) — 주간 장 시작 전 리포트 완성
+    - cron: '30 23 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  weekly-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 코드 불러오기
+        uses: actions/checkout@v4
+
+      - name: 2. Python 3.12 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 3. 라이브러리 설치
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. 주간 누락 보정 수집 (최근 10일)
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+        run: |
+          python main.py --mode all --days 10
+          python collectors/sentiment_collector.py --days 2000
+
+      - name: 5. 이벤트 스터디 · 국면 분석 · 자동 해석 리포트 생성
+        run: |
+          python analysis/event_study.py
+          python analysis/regime_event_study.py
+          python analysis/interpreter.py
+
+      - name: 6. 최신 DB 및 분석 산출물(CSV/HTML/리포트) 자동 저장
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add kr_quant.db outputs/
+          git diff --staged --quiet || git commit -m "chore(report): weekly quant analysis & auto-interpretation"
+          git push
