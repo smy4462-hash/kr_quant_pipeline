@@ -1,6 +1,7 @@
 import sqlite3
+from pathlib import Path
 
-DB_PATH = "kr_quant.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "kr_quant.db"
 
 def init_db():
     """SQLite DB 및 테이블 생성"""

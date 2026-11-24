@@ -1,32 +1,38 @@
-import os
-from datetime import datetime, timedelta
-from pykrx import stock
+import FinanceDataReader as fdr
+
+
+def _format_date(date_str: str) -> str:
+    """'YYYYMMDD' 형식을 'YYYY-MM-DD'로 변환"""
+    if len(date_str) == 8 and "-" not in date_str:
+        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    return date_str
+
 
 def get_kospi200_tickers():
-    """최근 7일 중 데이터가 있는 가장 최근 영업일 기준 코스피200 종목 반환"""
-    print(f"[체크] KRX_ID 로드 여부: {bool(os.getenv('KRX_ID'))}")
+    """DB가 비어 있을 때만 사용하는 예비 함수: 코스피 시가총액 상위 200개 종목 반환"""
+    df = fdr.StockListing("KOSPI")
+    if "Marcap" in df.columns:
+        df = df.sort_values("Marcap", ascending=False)
+    tickers = df["Code"].head(200).tolist()
+    print(f"[안내] 네이버/KRX 상장목록 기준 코스피 시총 상위 {len(tickers)}개 종목 조회 성공")
+    return tickers
 
-    for i in range(1, 8):
-        target_date = (datetime.today() - timedelta(days=i)).strftime("%Y%m%d")
-        try:
-            tickers = stock.get_index_portfolio_deposit_file("1028", date=target_date)
-            if len(tickers) > 0:
-                print(f"[안내] {target_date} 기준 코스피200 종목 {len(tickers)}개 조회 성공")
-                return tickers
-            else:
-                print(f"[{target_date}] 조회 결과 0건")
-        except Exception as e:
-            print(f"[{target_date}] 실패 원인: {type(e).__name__} - {e}")
 
-    raise RuntimeError("코스피200 종목을 불러오지 못했습니다.")
+def fetch_ohlcv(ticker: str, start_date: str, end_date: str):
+    """FinanceDataReader(네이버 금융)로 수정주가 OHLCV 수집"""
+    start = _format_date(start_date)
+    end = _format_date(end_date)
 
-def fetch_ohlcv(ticker, start_date, end_date):
-    df = stock.get_market_ohlcv(start_date, end_date, ticker)
-    if df.empty:
+    df = fdr.DataReader(ticker, start, end)
+    if df is None or df.empty:
         return []
 
-    df = df.reset_index()
-    df["date"] = df["날짜"].dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index()
+    date_col = df.columns[0]  # 보통 'Date'
+    df["date"] = df[date_col].dt.strftime("%Y-%m-%d")
     df["ticker"] = ticker
 
-    return df[["date", "ticker", "시가", "고가", "저가", "종가", "거래량"]].values.tolist()
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = df[col].astype(int)
+
+    return df[["date", "ticker", "Open", "High", "Low", "Close", "Volume"]].values.tolist()

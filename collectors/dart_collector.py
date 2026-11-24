@@ -8,7 +8,7 @@ DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DART_BUYBACK_URL = "https://opendart.fss.or.kr/api/tsstkAqDecsn.json"
 
 TARGET_KEYWORDS = [
-    "자기주식", "소각", "배당",
+    "소각", "자기주식", "배당",
     "단일판매", "공급계약",
     "유상증자", "전환사채", "신주인수권부사채",
     "영업(잠정)실적", "매출액또는손익구조"

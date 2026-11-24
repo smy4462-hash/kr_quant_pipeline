@@ -1,7 +1,7 @@
-pykrx
+finance-datareader
 pandas
-python-dotenv
-setuptools<81
-requests
-matplotlib
+numpy
+scipy
 plotly
+requests
+python-dotenv

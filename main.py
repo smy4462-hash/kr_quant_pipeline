@@ -33,7 +33,7 @@ def run_stock_pipeline(tickers, days):
         except Exception as e:
             print(f"[{idx}/{total}] [에러] {ticker} 수집 실패: {e}")
 
-        time.sleep(0.3)
+        time.sleep(0.1)
 
     print(f"=== [주가] 수집 완료: {success_cnt}/{total}개 종목 성공 ===")
 
@@ -81,16 +81,13 @@ if __name__ == "__main__":
 
     if args.tickers:
         target_tickers = args.tickers
-    elif args.mode == "dart":
+    else:
         target_tickers = get_saved_tickers()
         if target_tickers:
             print(f"[안내] DB에 저장된 코스피200 종목 {len(target_tickers)}개를 불러왔습니다.")
         else:
             from collectors.krx_collector import get_kospi200_tickers
             target_tickers = get_kospi200_tickers()
-    else:
-        from collectors.krx_collector import get_kospi200_tickers
-        target_tickers = get_kospi200_tickers()
 
     if args.mode in ("stock", "all"):
         run_stock_pipeline(tickers=target_tickers, days=args.days)

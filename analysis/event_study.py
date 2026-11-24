@@ -4,10 +4,14 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from scipy import stats
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT_DIR / "kr_quant.db"
 OUTPUT_DIR = ROOT_DIR / "outputs"
+
+TX_COST = 0.0025               # 왕복 거래비용 0.25% (거래세 + 수수료 + 슬리피지 보수적 반영)
+MIN_DAILY_VAL = 1_000_000_000  # 직전 5일 평균 일거래대금 10억 원 미만 저유동성 제외
 
 
 def load_data():
@@ -19,36 +23,73 @@ def load_data():
     return ohlcv, disc, buyback
 
 
-def prepare_market_metrics(ohlcv: pd.DataFrame) -> pd.DataFrame:
-    """종목별 수익률, 시장 초과수익률(AR), 평소 대비 거래량 배수 계산"""
+def classify_event_type(row) -> str:
+    """자기주식 공시를 취득/처분/소각으로 세분화해 호재·악재 혼재 노이즈 제거"""
+    title = str(row["report_nm"])
+    kw = str(row["keyword"])
+
+    if "소각" in title:
+        return "소각"
+    if kw == "자기주식" or "자기주식" in title:
+        if "처분" in title or "해지" in title:
+            return "자사주_처분/해지"
+        if "취득" in title or "신탁" in title:
+            return "자사주_취득/신탁"
+        return "자사주_기타"
+    return kw
+
+
+def prepare_market_metrics(ohlcv: pd.DataFrame):
+    """종목별 수익률, 갭/장중 수익률, 시장 벤치마크 일별 수익률 산출"""
     df = ohlcv.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    df["ret"] = df.groupby("ticker")["close"].pct_change()
-    df["trading_value"] = df["close"] * df["volume"]
+    df["prev_close"] = df.groupby("ticker")["close"].shift(1)
+    df["ret"] = df["close"] / df["prev_close"] - 1
 
-    mkt_ret = df.groupby("date")["ret"].transform("mean")
-    df["ar"] = df["ret"] - mkt_ret
+    # 오버나잇 갭 (전일 종가 -> 당일 시가) & 장중 수익률 (당일 시가 -> 당일 종가)
+    valid_open = df["open"] > 0
+    df["gap_ret"] = np.where(valid_open & (df["prev_close"] > 0), df["open"] / df["prev_close"] - 1, np.nan)
+    df["oc_ret"] = np.where(valid_open, df["close"] / df["open"] - 1, np.nan)
+
+    # 코스피200 동일가중 일별 시장 벤치마크
+    mkt_df = (
+        df.groupby("date")
+        .agg(
+            mkt_ret=("ret", "mean"),
+            mkt_gap=("gap_ret", "mean"),
+            mkt_oc=("oc_ret", "mean"),
+        )
+        .sort_index()
+    )
+
+    df = df.merge(mkt_df[["mkt_ret", "mkt_gap"]], on="date", how="left")
+    df["ar"] = df["ret"] - df["mkt_ret"]
+    df["excess_gap"] = df["gap_ret"] - df["mkt_gap"]
+
+    # 거래정지일(volume == 0)은 NaN 처리해 거래량·거래대금 왜곡 방지
+    clean_vol = df["volume"].replace(0, np.nan)
+    df["trading_value"] = np.where(df["volume"] > 0, df["close"] * df["volume"], np.nan)
 
     prev_5d_vol = (
-        df.groupby("ticker")["volume"]
+        clean_vol.groupby(df["ticker"])
         .transform(lambda s: s.shift(1).rolling(5, min_periods=3).mean())
-        .replace(0, np.nan)
     )
-    df["vol_ratio"] = df["volume"] / prev_5d_vol
+    df["vol_ratio"] = clean_vol / prev_5d_vol
 
     df["prev_5d_val"] = (
         df.groupby("ticker")["trading_value"]
         .transform(lambda s: s.shift(1).rolling(5, min_periods=3).mean())
-        .replace(0, np.nan)
     )
-    return df
+    return df, mkt_df
 
 
-def run_event_study(ohlcv: pd.DataFrame, disc: pd.DataFrame):
-    """공시일(D+0) 전후 요약 지표 및 D-3~D+5 일별 AR 타임라인 추출"""
-    events = disc.drop_duplicates(subset=["rcept_dt", "ticker", "keyword"]).copy()
+def run_event_study(ohlcv: pd.DataFrame, mkt_df: pd.DataFrame, disc: pd.DataFrame):
+    """이벤트별 갭/장중보유/시장중립 수익률 분해 및 타임라인 추출"""
+    events = disc.copy()
+    events["event_type"] = events.apply(classify_event_type, axis=1)
+    events = events.drop_duplicates(subset=["rcept_dt", "ticker", "event_type"]).copy()
     events["rcept_dt"] = pd.to_datetime(events["rcept_dt"])
 
     grouped_price = {
@@ -75,23 +116,46 @@ def run_event_study(ohlcv: pd.DataFrame, disc: pd.DataFrame):
         post_car = px_df.loc[d0 + 1 : d0 + 5, "ar"].sum() if d0 + 5 < len(px_df) else np.nan
         vol_spike = px_df.loc[d0, "vol_ratio"]
 
+        # D+0 종가 -> D+1 시가 오버나잇 갭 (초과수익 기준)
+        excess_gap = px_df.loc[d0 + 1, "excess_gap"] if d0 + 1 < len(px_df) else np.nan
+
+        # D+1 시가 -> D+5 종가 실전 보유수익 & 동일 기간 시장중립(헤지) 수익
         tradable_ret = np.nan
+        mkt_hold_ret = np.nan
+        mn_gross_ret = np.nan
+        mn_net_ret = np.nan
+
         if d0 + 5 < len(px_df):
             entry_open = px_df.loc[d0 + 1, "open"]
             exit_close = px_df.loc[d0 + 5, "close"]
             if entry_open and entry_open > 0:
                 tradable_ret = (exit_close / entry_open) - 1
 
+                # 동일 기간 시장 벤치마크 수익: (D+1 시가->종가) * (D+2~D+5 일별 종가수익률)
+                d1_date = px_df.loc[d0 + 1, "date"]
+                d2_to_d5_dates = px_df.loc[d0 + 2 : d0 + 5, "date"]
+                if d1_date in mkt_df.index:
+                    m_oc = mkt_df.loc[d1_date, "mkt_oc"]
+                    m_cc = mkt_df.reindex(d2_to_d5_dates)["mkt_ret"].dropna()
+                    if pd.notna(m_oc) and len(m_cc) == len(d2_to_d5_dates):
+                        mkt_hold_ret = (1 + m_oc) * np.prod(1 + m_cc.values) - 1
+                        mn_gross_ret = tradable_ret - mkt_hold_ret
+                        mn_net_ret = mn_gross_ret - TX_COST
+
         results.append({
             "rcept_no": ev["rcept_no"],
             "rcept_dt": ev["rcept_dt"].strftime("%Y-%m-%d"),
             "ticker": ticker,
             "corp_name": ev["corp_name"],
-            "keyword": ev["keyword"],
+            "event_type": ev["event_type"],
             "pre_car_3d": pre_car,
             "d0_ar": d0_ar,
             "post_car_5d": post_car,
+            "excess_gap": excess_gap,
             "tradable_ret_5d": tradable_ret,
+            "net_long_ret_5d": tradable_ret - TX_COST if pd.notna(tradable_ret) else np.nan,
+            "mn_gross_ret_5d": mn_gross_ret,
+            "mn_net_ret_5d": mn_net_ret,
             "vol_spike": vol_spike,
             "prev_5d_val": px_df.loc[d0, "prev_5d_val"],
         })
@@ -100,7 +164,7 @@ def run_event_study(ohlcv: pd.DataFrame, disc: pd.DataFrame):
             target_idx = d0 + rel_day
             if 0 <= target_idx < len(px_df) and pd.notna(px_df.loc[target_idx, "ar"]):
                 timeline_rows.append({
-                    "keyword": ev["keyword"],
+                    "event_type": ev["event_type"],
                     "rel_day": rel_day,
                     "ar": px_df.loc[target_idx, "ar"],
                 })
@@ -108,84 +172,102 @@ def run_event_study(ohlcv: pd.DataFrame, disc: pd.DataFrame):
     return pd.DataFrame(results), pd.DataFrame(timeline_rows)
 
 
-def plot_car_timeline_interactive(timeline_df: pd.DataFrame, ev_df: pd.DataFrame, save_path: Path):
-    """인터랙티브 차트 1: 키워드별 D-3 ~ D+5 누적 초과수익률(CAR) 궤적"""
-    valid_keywords = ev_df["keyword"].value_counts()
-    valid_keywords = valid_keywords[valid_keywords >= 5].index.tolist()
+def _sig_mark(p_val):
+    if pd.isna(p_val):
+        return "-"
+    if p_val < 0.01:
+        return "***"
+    if p_val < 0.05:
+        return "**"
+    if p_val < 0.10:
+        return "*"
+    return "-"
 
-    df = timeline_df[timeline_df["keyword"].isin(valid_keywords)]
-    pivot_ar = df.groupby(["rel_day", "keyword"])["ar"].mean().unstack()
+
+def calc_decomposition_summary(ev_df: pd.DataFrame) -> pd.DataFrame:
+    """이벤트 유형별 갭 vs 시장중립 실전수익(비용후) 통계 검증"""
+    rows = []
+    for etype, grp in ev_df.groupby("event_type"):
+        mn_net = grp["mn_net_ret_5d"].dropna()
+        gap = grp["excess_gap"].dropna()
+
+        if len(mn_net) >= 2:
+            t_mn, p_mn = stats.ttest_1samp(mn_net, 0.0)
+        else:
+            t_mn, p_mn = np.nan, np.nan
+
+        rows.append({
+            "event_type": etype,
+            "건수": len(grp),
+            "사후_CAR(%)": grp["post_car_5d"].mean() * 100,
+            "오버나잇갭_초과(%)": gap.mean() * 100 if len(gap) else np.nan,
+            "시장중립_비용전(%)": grp["mn_gross_ret_5d"].mean() * 100,
+            "시장중립_비용후(%)": mn_net.mean() * 100 if len(mn_net) else np.nan,
+            "t_stat(중립)": t_mn,
+            "p_value(중립)": p_mn,
+            "유의성": _sig_mark(p_mn),
+            "승률_중립(%)": (mn_net > 0).mean() * 100 if len(mn_net) else np.nan,
+            "롱온리_비용후(%)": grp["net_long_ret_5d"].mean() * 100,
+        })
+
+    summary = pd.DataFrame(rows).set_index("event_type").sort_values("건수", ascending=False)
+    num_cols = [c for c in summary.columns if c not in ("건수", "유의성", "p_value(중립)")]
+    summary[num_cols] = summary[num_cols].round(2)
+    summary["p_value(중립)"] = summary["p_value(중립)"].round(4)
+    return summary
+
+
+def plot_alpha_decomposition(summary: pd.DataFrame, save_path: Path):
+    """인터랙티브 차트: 오버나잇 갭 vs 시장중립 보유수익 분해"""
+    plot_df = summary[summary["건수"] >= 30].reset_index()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="오버나잇 갭 초과 (D0종→D1시)", x=plot_df["event_type"], y=plot_df["오버나잇갭_초과(%)"], marker_color="#ff7f0e"))
+    fig.add_trace(go.Bar(name="시장중립 보유수익 (비용전)", x=plot_df["event_type"], y=plot_df["시장중립_비용전(%)"], marker_color="#1f77b4"))
+    fig.add_trace(go.Bar(name="시장중립 실전수익 (비용후 0.25%)", x=plot_df["event_type"], y=plot_df["시장중립_비용후(%)"], marker_color="#2ca02c"))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.update_layout(
+        barmode="group",
+        title="공시 이벤트 알파 분해: 오버나잇 갭 vs 시장중립 실전 보유수익 (n≥30)",
+        xaxis_title="공시 유형",
+        yaxis_title="평균 초과수익률 (%)",
+        template="plotly_white",
+    )
+    fig.write_html(save_path, include_plotlyjs="cdn")
+
+
+def plot_car_timeline_interactive(timeline_df: pd.DataFrame, ev_df: pd.DataFrame, save_path: Path):
+    """인터랙티브 차트: 세분화된 공시 유형별 CAR 궤적"""
+    valid_types = ev_df["event_type"].value_counts()
+    valid_types = valid_types[valid_types >= 30].index.tolist()
+
+    df = timeline_df[timeline_df["event_type"].isin(valid_types)]
+    pivot_ar = df.groupby(["rel_day", "event_type"])["ar"].mean().unstack()
     pivot_car = (pivot_ar.cumsum() * 100).round(2)
 
     fig = go.Figure()
     for col in pivot_car.columns:
-        cnt = int((ev_df["keyword"] == col).sum())
+        cnt = int((ev_df["event_type"] == col).sum())
         fig.add_trace(
             go.Scatter(
                 x=pivot_car.index,
                 y=pivot_car[col],
                 mode="lines+markers",
                 name=f"{col} (n={cnt})",
-                hovertemplate=(
-                    f"<b>{col}</b><br>"
-                    "영업일: D%{x:+d}<br>"
-                    "누적 초과수익률(CAR): %{y:.2f}%<extra></extra>"
-                ),
+                hovertemplate=f"<b>{col}</b><br>영업일: D%{{x:+d}}<br>CAR: %{{y:.2f}}%<extra></extra>",
             )
         )
 
     fig.add_vline(x=0, line_dash="dash", line_color="crimson", annotation_text="공시일 (D+0)")
     fig.add_hline(y=0, line_dash="dot", line_color="gray")
-
     fig.update_layout(
-        title="공시 키워드별 누적 초과수익률(CAR) 궤적 (D-3 ~ D+5)",
+        title="세분화된 공시 유형별 누적 초과수익률(CAR) 궤적 (D-3 ~ D+5)",
         xaxis_title="공시일 기준 영업일 (D+0 = 공시일)",
         yaxis_title="누적 초과수익률 CAR (%)",
         xaxis=dict(tickmode="linear", tick0=-3, dtick=1),
         hovermode="x unified",
         template="plotly_white",
-        legend_title="키워드 (클릭해서 숨기기/보기)",
     )
-    # include_plotlyjs="cdn"으로 저장하면 HTML 파일 용량이 매우 가벼워짐
-    fig.write_html(save_path, include_plotlyjs="cdn")
-
-
-def plot_buyback_scatter_interactive(bb_df: pd.DataFrame, save_path: Path):
-    """인터랙티브 차트 2: 자사주 매입 강도 vs 공시 당일 초과수익률(AR)"""
-    plot_df = bb_df.dropna(subset=["매입강도_일거래대금배수", "당일_AR(%)"]).copy()
-    if plot_df.empty:
-        return
-
-    plot_df["반응구분"] = np.where(plot_df["당일_AR(%)"] >= 0, "상승 (AR ≥ 0)", "하락 (AR < 0)")
-
-    fig = px.scatter(
-        plot_df,
-        x="매입강도_일거래대금배수",
-        y="당일_AR(%)",
-        color="반응구분",
-        text="corp_name",
-        color_discrete_map={"상승 (AR ≥ 0)": "#1f77b4", "하락 (AR < 0)": "#d62728"},
-        hover_data={
-            "corp_name": True,
-            "rcept_dt": True,
-            "예정금액_억": ":,.1f",
-            "매입강도_일거래대금배수": ":.2f",
-            "당일_AR(%)": ":.2f",
-            "실전수익률(%)": ":.2f",
-            "반응구분": False,
-        },
-        title="자사주 매입 강도(일거래대금 배수) vs 공시 당일 초과수익률",
-        labels={
-            "매입강도_일거래대금배수": "매입 강도 (취득예정금액 ÷ 직전 5일 평균 일거래대금)",
-            "당일_AR(%)": "공시 당일 초과수익률 AR (%)",
-            "corp_name": "기업명",
-            "rcept_dt": "공시일",
-        },
-        template="plotly_white",
-    )
-
-    fig.update_traces(textposition="top center", marker=dict(size=12, line=dict(width=1, color="black")))
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.write_html(save_path, include_plotlyjs="cdn")
 
 
@@ -195,50 +277,59 @@ def main():
     ohlcv_raw, disc, buyback = load_data()
     print(f"[데이터 로드] 주가 {len(ohlcv_raw):,}건 | 공시 {len(disc):,}건 | 자사주 상세 {len(buyback):,}건")
 
-    ohlcv = prepare_market_metrics(ohlcv_raw)
-    ev_df, timeline_df = run_event_study(ohlcv, disc)
+    ohlcv, mkt_df = prepare_market_metrics(ohlcv_raw)
+    ev_df, timeline_df = run_event_study(ohlcv, mkt_df, disc)
 
-    if ev_df.empty:
-        print("[안내] 주가 기간과 겹치는 공시 이벤트가 없습니다.")
-        return
+    # 1. 세분화 이벤트별 갭 & 시장중립 수익 분해
+    summary = calc_decomposition_summary(ev_df)
+    print("\n================ [1] 공시 세분화 & 알파 분해 (오버나잇 갭 vs 시장중립 실전수익) ================")
+    print(summary.to_string())
+    print("(* p<0.10, ** p<0.05, *** p<0.01 | 시장중립 실전수익 = D+1시가~D+5종가 초과수익 - 거래비용 0.25%)")
 
-    # 1. 키워드별 요약 CSV + 인터랙티브 HTML 차트 저장
-    summary = (
-        ev_df.groupby("keyword")
-        .agg(
-            건수=("ticker", "count"),
-            선반영_CAR_D3_1=("pre_car_3d", lambda s: s.mean() * 100),
-            당일_AR_D0=("d0_ar", lambda s: s.mean() * 100),
-            사후_CAR_D1_5=("post_car_5d", lambda s: s.mean() * 100),
-            실전수익률_D1시가_D5종가=("tradable_ret_5d", lambda s: s.mean() * 100),
-            당일거래량배수=("vol_spike", "mean"),
-        )
-        .round(2)
-        .sort_values("건수", ascending=False)
-    )
     summary.to_csv(OUTPUT_DIR / "keyword_event_summary.csv", encoding="utf-8-sig")
+    plot_alpha_decomposition(summary, OUTPUT_DIR / "alpha_decomposition.html")
     plot_car_timeline_interactive(timeline_df, ev_df, OUTPUT_DIR / "car_timeline.html")
-    print("[저장 완료] outputs/keyword_event_summary.csv, outputs/car_timeline.html")
 
-    # 2. 자사주 강도 CSV + 인터랙티브 HTML 차트 저장
+    # 2. 자사주 매입 강도별 갭 & 시장중립 성과 비교
     if not buyback.empty:
         bb = buyback.merge(
-            ev_df[["rcept_no", "rcept_dt", "d0_ar", "post_car_5d", "tradable_ret_5d", "prev_5d_val"]],
+            ev_df[["rcept_no", "rcept_dt", "d0_ar", "post_car_5d", "excess_gap", "mn_gross_ret_5d", "mn_net_ret_5d", "net_long_ret_5d", "prev_5d_val"]],
             on="rcept_no",
             how="inner",
         )
         if not bb.empty:
             bb["예정금액_억"] = (bb["aqpln_prc_ostk"] / 1e8).round(1)
-            bb["매입강도_일거래대금배수"] = (bb["aqpln_prc_ostk"] / bb["prev_5d_val"]).round(2)
-            bb["당일_AR(%)"] = (bb["d0_ar"] * 100).round(2)
-            bb["실전수익률(%)"] = (bb["tradable_ret_5d"] * 100).round(2)
+            bb["매입강도"] = (bb["aqpln_prc_ostk"] / bb["prev_5d_val"]).round(2)
+            bb_valid = bb.dropna(subset=["매입강도", "prev_5d_val"]).copy()
+            bb_valid = bb_valid[bb_valid["prev_5d_val"] >= MIN_DAILY_VAL].copy()
+            bb_valid["강도그룹"] = np.where(bb_valid["매입강도"] >= 3.0, "고강도 (≥3배)", "저강도 (<3배)")
 
-            cols = ["rcept_dt", "corp_name", "예정금액_억", "매입강도_일거래대금배수", "당일_AR(%)", "실전수익률(%)"]
-            bb_out = bb[cols].sort_values("매입강도_일거래대금배수", ascending=False)
+            grp_rows = []
+            for gname, g in bb_valid.groupby("강도그룹"):
+                mn = g["mn_net_ret_5d"].dropna()
+                t_val, p_val = stats.ttest_1samp(mn, 0.0) if len(mn) >= 2 else (np.nan, np.nan)
+                grp_rows.append({
+                    "강도그룹": gname,
+                    "건수": len(g),
+                    "사후_CAR(%)": g["post_car_5d"].mean() * 100,
+                    "오버나잇갭(%)": g["excess_gap"].mean() * 100,
+                    "시장중립_비용전(%)": g["mn_gross_ret_5d"].mean() * 100,
+                    "시장중립_비용후(%)": mn.mean() * 100 if len(mn) else np.nan,
+                    "t_stat": t_val,
+                    "p_value": p_val,
+                    "승률_중립(%)": (mn > 0).mean() * 100 if len(mn) else np.nan,
+                })
+            grp_df = pd.DataFrame(grp_rows).set_index("강도그룹")
+            num_cols = [c for c in grp_df.columns if c not in ("건수", "p_value")]
+            grp_df[num_cols] = grp_df[num_cols].round(2)
+            grp_df["p_value"] = grp_df["p_value"].round(4)
 
-            bb_out.to_csv(OUTPUT_DIR / "buyback_intensity.csv", index=False, encoding="utf-8-sig")
-            plot_buyback_scatter_interactive(bb_out, OUTPUT_DIR / "buyback_scatter.html")
-            print("[저장 완료] outputs/buyback_intensity.csv, outputs/buyback_scatter.html")
+            print("\n================ [2] 자사주 매입 강도별 갭 & 시장중립 성과 비교 ================")
+            print(grp_df.to_string())
+
+            bb.to_csv(OUTPUT_DIR / "buyback_intensity.csv", index=False, encoding="utf-8-sig")
+
+    print(f"\n[저장 완료] outputs/alpha_decomposition.html, car_timeline.html 업데이트 완료")
 
 
 if __name__ == "__main__":
