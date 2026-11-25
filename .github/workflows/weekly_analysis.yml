@@ -50,3 +50,10 @@ jobs:
           git add kr_quant.db outputs/
           git diff --staged --quiet || git commit -m "chore(report): weekly quant analysis & auto-interpretation"
           git push
+
+      - name: 7. 텔레그램 주간 브리핑 자동 발송
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python notifiers/telegram_bot.py --attach-report
