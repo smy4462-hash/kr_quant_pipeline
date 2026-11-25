@@ -42,11 +42,15 @@ def format_event_name(etype: str) -> str:
 
 
 def get_current_regimes(conn: sqlite3.Connection) -> dict:
-    """VIX, VKOSPI, 옵션 풋콜비율 최신 확정치 및 Expanding Q75 공포 여부 판정"""
+    """VIX(메인), VKOSPI·옵션 풋콜비율(보조) 최신 확정치 및 Expanding Q75 공포 여부 판정"""
     sent = pd.read_sql("SELECT date, vix, vkospi, pcr_val FROM market_sentiment ORDER BY date", conn)
     regimes = {}
 
-    for col, label in [("vix", "미국 VIX"), ("vkospi", "한국 VKOSPI"), ("pcr_val", "옵션 풋콜비율")]:
+    for col, label in [
+        ("vix", "미국 VIX"),
+        ("vkospi", "한국 VKOSPI"),
+        ("pcr_val", "옵션 풋콜비율"),
+    ]:
         sub = sent[["date", col]].dropna().reset_index(drop=True)
         if len(sub) < MIN_PERIODS:
             regimes[col] = {"label": label, "is_fear": False, "val": None, "cutoff": None, "date": "확인불가"}
@@ -107,22 +111,21 @@ def build_daily_alert(days: int = 1) -> tuple[str, bool]:
     conn.close()
 
     vix_fear = regimes["vix"]["is_fear"]
-    pcr_fear = regimes["pcr_val"]["is_fear"]
     vix_state = "공포" if vix_fear else "평온"
-    pcr_state = "공포" if pcr_fear else "평온"
 
-    # 1) 헤더 & 현재 시장 국면 진단
+    # 1) 헤더 & 현재 시장 국면 진단 (실증 검증 메인 필터인 미국 VIX 중심)
     lines = [
         f"[KR Quant 일간 시그널 브리핑] {latest_dt_str}",
         "",
         "■ 현재 시장 국면 진단",
-        f"현재 시장은 미국 VIX {vix_state}, 옵션 풋콜비율 {pcr_state} 국면입니다.",
+        f"메인 국면 필터인 미국 VIX는 현재 {vix_state} 국면입니다.",
     ]
     for col in ("vix", "vkospi", "pcr_val"):
         r = regimes[col]
         badge = "🔴 공포" if r["is_fear"] else "🟢 평온"
+        role = "메인" if col == "vix" else "보조"
         val_str = f"현재 {r['val']}, 기준 {r['cutoff']}" if r["val"] is not None else "데이터 없음"
-        lines.append(f"• {r['label']}: {badge} | {val_str}")
+        lines.append(f"• {r['label']} [{role}]: {badge} | {val_str}")
 
     if disc.empty:
         lines.extend(["", "조회 기간 내 신규 핵심 공시가 없습니다."])
@@ -160,12 +163,10 @@ def build_daily_alert(days: int = 1) -> tuple[str, bool]:
                 block.append(url_line)
             return "\n".join(block)
 
-        # 실증 검증 시그널 매칭
+        # KODEX 200 스트레스 테스트 통과 시그널만 핵심 경보로 분류
         if etype == "자사주_취득/신탁":
             if vix_fear and intensity is not None and intensity >= 3.0:
                 long_alerts.append(_format_block(f"• {row['corp_name']} {ticker} | 미국 VIX 공포 국면 고강도 자사주"))
-            elif pcr_fear:
-                long_alerts.append(_format_block(f"• {row['corp_name']} {ticker} | 옵션 풋콜비율 공포 국면 자사주 취득"))
             else:
                 watch_buybacks.append(_format_block(f"• {row['corp_name']} {ticker} | {clean_ev}"))
         elif etype == "자사주_처분/해지":
@@ -184,7 +185,7 @@ def build_daily_alert(days: int = 1) -> tuple[str, bool]:
         lines.extend([
             "",
             "■ 핵심 기회형 매수 경보",
-            "익일 시가 진입 후 5영업일 보유 전략을 검토하시기 바랍니다.",
+            "익일 시가 진입 후 20영업일 보유 전략을 검토하시기 바랍니다.",
             "",
         ])
         lines.extend(long_alerts)
@@ -202,7 +203,7 @@ def build_daily_alert(days: int = 1) -> tuple[str, bool]:
         lines.extend([
             "",
             f"■ 자사주 및 소각 모니터링 | 총 {len(watch_buybacks)}건",
-            "현재 평온 국면으로 참고용 모니터링 대상입니다.",
+            "실전 매매 경보 기준 미충족으로 참고용 모니터링 대상입니다.",
             "",
         ])
         lines.extend(watch_buybacks[:5])
@@ -213,7 +214,7 @@ def build_daily_alert(days: int = 1) -> tuple[str, bool]:
         lines.extend([
             "",
             f"■ 일반 회피 필터 대상 | 총 {len(general_avoid)}건",
-            "실적, 배당, 손익구조 공시 종목으로 5영업일간 신규 매수 보류를 권고합니다.",
+            "실적, 배당, 손익구조 공시 종목으로 5영업일에서 20영업일간 신규 매수 보류를 권고합니다.",
             "",
         ])
         lines.extend(general_avoid[:5])
@@ -227,7 +228,7 @@ def build_daily_alert(days: int = 1) -> tuple[str, bool]:
         "",
         "────────────────────",
         f"조회 기간: {cutoff_dt} ~ {latest_dt_str}",
-        "기준: 일평균 거래대금 10억 원 이상 코스피200 종목",
+        "검증 기준: KODEX 200 헤지 · 일평균 거래대금 10억 원 이상",
     ])
     return "\n".join(lines), has_actionable
 
