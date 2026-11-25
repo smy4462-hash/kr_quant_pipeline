@@ -1,12 +1,15 @@
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = ROOT_DIR / "kr_quant.db"
 OUTPUT_DIR = ROOT_DIR / "outputs"
+MIN_PERIODS = 60
 
 # ==============================================================================
-# 1. 챗봇·텔레그램 응답용 핵심 용어 사전 (초보자 친화적 정의)
+# 1. 챗봇·상세 리포트용 핵심 용어 사전
 # ==============================================================================
 GLOSSARY = {
     "롱온리(Long-Only)": "종목을 단순 매수해 보유했을 때의 절대 수익률 (시장 등락인 베타가 섞여 있음).",
@@ -21,9 +24,6 @@ GLOSSARY = {
     "기회형 알파 슬리브": "발생 빈도는 낮지만(연 2~5회) 승률과 기대수익이 높은 고확신 시그널을 별도 비중으로 운용하는 방식.",
 }
 
-# ==============================================================================
-# 2. 5단계 퀀트 결과 판독 매뉴얼 (상세 리포트 자동 첨부용)
-# ==============================================================================
 METHODOLOGY_MANUAL = """## 0. 5단계 퀀트 결과 판독 매뉴얼 (해석 방법론)
 
 본 리포트의 모든 자동 진단은 아래 5단계 연결 판독 규칙(If-Then)에 따라 수행됩니다.
@@ -53,6 +53,59 @@ RESEARCH_CAVEATS = """## 5. 연구의 구조적 한계 및 실전 주의사항 (
 3. **공매도 규제 및 대차비용:** 음(-)의 알파 시그널을 직접 숏 전략으로 구현할 경우 공매도 금지 기간 및 대차수수료를 별도 반영해야 하므로, 실무에서는 **신규 매수 보류·비중 축소(Avoidance) 필터** 적용을 권장합니다.
 4. **공시 시각 미구분:** OpenDART 목록 API는 일자(`rcept_dt`)만 제공하므로 장중 공시와 장 마감 후 공시가 혼재되어 있습니다. (단, 진입 시점을 보수적으로 `D+1 시가`로 고정해 미래참조 편향은 차단했습니다.)
 """
+
+
+def format_event_name(etype: str) -> str:
+    """내부 분류명을 괄호·언더바 없는 정식 표기로 변환"""
+    mapping = {
+        "자사주_취득/신탁": "자사주 취득 및 신탁",
+        "자사주_처분/해지": "자사주 처분 및 해지",
+        "영업(잠정)실적": "영업잠정실적",
+        "매출액또는손익구조": "매출액 또는 손익구조",
+        "단일판매": "단일판매 공급계약",
+    }
+    return mapping.get(etype, etype.replace("_", " "))
+
+
+def format_indicator_name(label: str) -> str:
+    """파생지표 명칭을 괄호 없는 정식 표기로 변환"""
+    mapping = {
+        "미국 VIX": "미국 VIX",
+        "한국 VKOSPI": "한국 VKOSPI",
+        "옵션 PCR(거래대금)": "옵션 풋콜비율",
+    }
+    return mapping.get(label, label)
+
+
+def get_current_regimes() -> dict:
+    """DB에서 3대 파생 심리지표의 최신 확정치 및 공포/평온 국면 조회"""
+    if not DB_PATH.exists():
+        return {}
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        sent = pd.read_sql("SELECT date, vix, vkospi, pcr_val FROM market_sentiment ORDER BY date", conn)
+    except Exception:
+        conn.close()
+        return {}
+    conn.close()
+
+    regimes = {}
+    for col, label in [("vix", "미국 VIX"), ("vkospi", "한국 VKOSPI"), ("pcr_val", "옵션 풋콜비율")]:
+        if col not in sent.columns:
+            continue
+        sub = sent[["date", col]].dropna().reset_index(drop=True)
+        if len(sub) < MIN_PERIODS:
+            continue
+        sub["cutoff"] = sub[col].expanding(min_periods=MIN_PERIODS).quantile(0.75)
+        latest = sub.iloc[-1]
+        regimes[col] = {
+            "label": label,
+            "is_fear": bool(latest[col] >= latest["cutoff"]),
+            "val": round(float(latest[col]), 2),
+            "cutoff": round(float(latest["cutoff"]), 2),
+            "date": str(latest["date"]),
+        }
+    return regimes
 
 
 def diagnose_event_row(row: pd.Series, total_tests: int) -> dict:
@@ -100,18 +153,23 @@ def diagnose_event_row(row: pd.Series, total_tests: int) -> dict:
         tags.append("분포건전")
 
     if is_sig and mn_net <= -0.4 and n >= 30:
-        action = "리스크 회피(Avoidance) 필터 — 5영업일 신규매수 보류/비중축소"
+        action = "리스크 회피 필터 적용 권고"
+        md_action = "리스크 회피(Avoidance) 필터 — 5영업일 신규매수 보류/비중축소"
     elif is_sig and mn_net >= 0.5 and n >= 30:
-        action = "메인 롱 이벤트 전략 후보"
+        action = "메인 매수 전략 후보"
+        md_action = "메인 롱 이벤트 전략 후보"
     elif is_sig and mn_net >= 0.5 and n < 30:
-        action = "소표본 참고 시그널 (추가 표본 축적 필요)"
+        action = "소표본 참고 시그널"
+        md_action = "소표본 참고 시그널 (추가 표본 축적 필요)"
     else:
-        action = "단독 매매 비추천 (알파 미미 또는 통계 비유의)"
+        action = "단독 매매 비추천"
+        md_action = "단독 매매 비추천 (알파 미미 또는 통계 비유의)"
 
     return {
         "tags": tags,
         "summary": " / ".join(notes) if notes else "특이 괴리 없음",
         "action": action,
+        "md_action": md_action,
         "is_sig": is_sig,
         "is_bonf": is_bonf,
     }
@@ -146,18 +204,22 @@ def diagnose_regime_row(row: pd.Series, total_tests: int) -> dict:
         tags.append("국면비중확대(체제변화주의)")
 
     if pd.notna(p_diff) and p_diff < 0.05 and fear_ret <= -1.0:
-        action = f"공포장 강력 회피 필터 (평온 {calm_ret:+.2f}% → 공포 {fear_ret:+.2f}%, 승률 {fear_win:.1f}%)"
+        tg_role = "강력 회피 권고"
+        md_action = f"공포장 강력 회피 필터 (평온 {calm_ret:+.2f}% → 공포 {fear_ret:+.2f}%, 승률 {fear_win:.1f}%)"
     elif pd.notna(p_diff) and p_diff < 0.05 and fear_ret >= 1.0:
-        action = f"공포장 기회형 롱 후보 (평온 {calm_ret:+.2f}% → 공포 {fear_ret:+.2f}%, 승률 {fear_win:.1f}%)"
+        tg_role = "기회형 매수 후보"
+        md_action = f"공포장 기회형 롱 후보 (평온 {calm_ret:+.2f}% → 공포 {fear_ret:+.2f}%, 승률 {fear_win:.1f}%)"
     else:
-        action = "국면별 유의미한 차별화 없음"
+        tg_role = "유의미한 차별화 없음"
+        md_action = "국면별 유의미한 차별화 없음"
 
     return {
         "tags": tags,
         "diff": diff,
         "p_diff": p_diff,
         "fear_n": fear_n,
-        "action": action,
+        "tg_role": tg_role,
+        "action": md_action,
         "is_strong": pd.notna(p_diff) and p_diff < 0.05,
     }
 
@@ -169,6 +231,7 @@ def generate_reports():
 
     kw_df = pd.read_csv(kw_path, index_col=0, encoding="utf-8-sig")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    date_only = datetime.now().strftime("%Y-%m-%d")
 
     md_lines = [
         f"# 퀀트 이벤트 스터디 자동 해석 리포트 ({now_str})",
@@ -178,14 +241,31 @@ def generate_reports():
         METHODOLOGY_MANUAL,
         "## 1. 전 기간 공시 유형별 자동 진단 (Step 1 · 2 · 5)",
     ]
-    tg_lines = [
-        f"📊 [KR Quant 자동 리포트] {now_str}",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "1️⃣ 전 기간 핵심 시그널 (시장중립·비용0.25% 차감)",
-    ]
+
+    # 텔레그램 주간 브리핑: 격식체 · 괄호 최소화 · 2단 계층 구조
+    tg_lines = [f"[KR Quant 주간 리포트] {date_only}", ""]
+
+    # 0) 현재 시장 국면 진단 (최상단 배치)
+    regimes = get_current_regimes()
+    if regimes:
+        vix_state = "공포" if regimes.get("vix", {}).get("is_fear") else "평온"
+        pcr_state = "공포" if regimes.get("pcr_val", {}).get("is_fear") else "평온"
+        tg_lines.append("■ 현재 시장 국면 진단")
+        tg_lines.append(f"현재 시장은 미국 VIX {vix_state}, 옵션 풋콜비율 {pcr_state} 국면입니다.")
+        for col in ("vix", "vkospi", "pcr_val"):
+            if col in regimes:
+                r = regimes[col]
+                badge = "🔴 공포" if r["is_fear"] else "🟢 평온"
+                tg_lines.append(f"• {r['label']}: {badge} | 현재 {r['val']}, 기준 {r['cutoff']}")
+        tg_lines.append("")
 
     # 1) 전 기간 공시 해석
+    tg_lines.append("■ 1. 전 기간 핵심 시그널")
+    tg_lines.append("아래 공시 발생 시 5영업일간 신규 매수 보류를 권고합니다.")
+    tg_lines.append("")
+
     total_kw_tests = len(kw_df)
+    has_base_signal = False
     for etype, row in kw_df.iterrows():
         diag = diagnose_event_row(row, total_tests=total_kw_tests)
         tag_str = " ".join(f"`{t}`" for t in diag["tags"]) if diag["tags"] else "`특이사항없음`"
@@ -193,16 +273,21 @@ def generate_reports():
             f"- **{etype}** (n={int(row['건수'])}, 시장중립 {row['시장중립_비용후(%)']:+.2f}%, "
             f"p={row['p_value(중립)']:.4f}, 승률 {row['승률_중립(%)']:.1f}%) | {tag_str}\n"
             f"  - 진단: {diag['summary']}\n"
-            f"  - 실전 역할: **{diag['action']}**"
+            f"  - 실전 역할: **{diag['md_action']}**"
         )
         if diag["is_bonf"] or (diag["is_sig"] and abs(row["시장중립_비용후(%)"]) >= 0.5):
-            icon = "🔻" if row["시장중립_비용후(%)"] < 0 else "🔺"
+            has_base_signal = True
+            clean_name = format_event_name(etype)
+            tg_lines.append(f"• {clean_name} | {diag['action']}")
             tg_lines.append(
-                f"{icon} {etype}: {row['시장중립_비용후(%)']:+.2f}% "
-                f"(승률 {row['승률_중립(%)']:.0f}%, p={row['p_value(중립)']:.4f}) → {diag['action'].split('—')[0].strip()}"
+                f"  시장중립 수익률 {row['시장중립_비용후(%)']:+.2f}% | "
+                f"승률 {row['승률_중립(%)']:.0f}% | 유의확률 {row['p_value(중립)']:.4f}"
             )
 
-    # 2) 3대 파생 심리지표(VIX · VKOSPI · PCR) 국면별 교차 진단
+    if not has_base_signal:
+        tg_lines.append("• 유의미한 전 기간 시그널이 없습니다.")
+
+    # 2) 3대 파생 심리지표 국면별 교차 진단
     regime_sources = [
         ("미국 VIX", OUTPUT_DIR / "regime_event_summary.csv"),
         ("한국 VKOSPI", OUTPUT_DIR / "regime_vkospi_summary.csv"),
@@ -210,7 +295,12 @@ def generate_reports():
     ]
 
     md_lines.extend(["", "## 2. 3대 파생 심리지표(VIX · VKOSPI · PCR) 국면별 자동 진단 (Step 3)"])
-    tg_lines.extend(["", "2️⃣ 파생 공포 국면(Expanding Q75) 특이 시그널"])
+    tg_lines.extend([
+        "",
+        "■ 2. 공포 국면 진입 시 작동하는 조건부 시그널",
+        "과거 5년 검증 결과, 공포 국면에서만 유의미한 알파가 확인된 조건입니다.",
+        "",
+    ])
 
     found_any_regime = False
     for label, csv_path in regime_sources:
@@ -222,6 +312,8 @@ def generate_reports():
 
         md_lines.append(f"\n### [{label}] 공포 vs 평온 국면 진단")
         total_reg_tests = len(reg_df) * 2
+        clean_ind = format_indicator_name(label)
+
         for etype, row in reg_df.iterrows():
             diag = diagnose_regime_row(row, total_tests=total_reg_tests)
             tag_str = " ".join(f"`{t}`" for t in diag["tags"]) if diag["tags"] else "`국면차이없음`"
@@ -231,12 +323,14 @@ def generate_reports():
             )
             if diag["is_strong"]:
                 found_any_regime = True
+                clean_ev = format_event_name(etype)
+                tg_lines.append(f"• {clean_ev} | {clean_ind} 공포 시 {diag['tg_role']}")
                 tg_lines.append(
-                    f"⚡ [{label}] {etype}: 평온 {row['평온_중립수익(%)']:+.2f}% → 공포 {row['공포_중립수익(%)']:+.2f}% "
-                    f"(p={diag['p_diff']:.4f}, 공포 승률 {row['공포_승률(%)']:.0f}%)"
+                    f"  평온 {row['평온_중립수익(%)']:+.2f}% → 공포 {row['공포_중립수익(%)']:+.2f}% | "
+                    f"공포 승률 {row['공포_승률(%)']:.0f}% | 유의확률 {diag['p_diff']:.4f}"
                 )
 
-    # 3) 고강도 자사주(>=3배) 3대 파생 지표 비교 (이상치 왜곡 자동 감지 포함)
+    # 3) 고강도 자사주(>=3배) 3대 파생 지표 비교
     bb_multi_path = OUTPUT_DIR / "regime_buyback_multi.csv"
     if bb_multi_path.exists():
         bb_df = pd.read_csv(bb_multi_path, encoding="utf-8-sig")
@@ -248,7 +342,8 @@ def generate_reports():
                 ret_bb = r["시장중립_비용후(%)"]
                 p_bb = r["p_value(vs 0)"]
                 win_bb = r["승률(%)"]
-                p_str = f"{p_bb:.4f}" if pd.notna(p_bb) else "N/A"
+                p_str = f"{p_bb:.4f}" if pd.notna(p_bb) else "산출불가"
+                clean_ind = format_indicator_name(str(r["지표"]))
 
                 extra_notes = []
                 if n_bb < 30:
@@ -263,25 +358,31 @@ def generate_reports():
 
                 if pd.notna(p_bb) and p_bb < 0.05 and ret_bb > 0:
                     found_any_regime = True
+                    tg_lines.append(f"• 고강도 자사주 3배 이상 | {clean_ind} 공포 시 기회형 매수 후보")
                     tg_lines.append(
-                        f"🔥 [{r['지표']}] 고강도 자사주: 공포장 {ret_bb:+.2f}% (승률 {win_bb:.0f}%, p={p_str}, n={n_bb})"
+                        f"  공포 수익률 {ret_bb:+.2f}% | 승률 {win_bb:.0f}% | 유의확률 {p_str} | 표본 {n_bb}건"
                     )
                 elif win_bb >= 70.0 and ret_bb >= 1.5 and (pd.isna(p_bb) or p_bb >= 0.05):
                     found_any_regime = True
+                    tg_lines.append(f"• 고강도 자사주 3배 이상 | {clean_ind} 공포 시 이상치 주의 모니터링")
                     tg_lines.append(
-                        f"👀 [{r['지표']}] 고강도 자사주: 공포장 {ret_bb:+.2f}% (승률 {win_bb:.0f}%, n={n_bb}, 이상치 분산 주의)"
+                        f"  공포 수익률 {ret_bb:+.2f}% | 승률 {win_bb:.0f}% | 표본 {n_bb}건, 손절 통제 필요"
                     )
 
     if not found_any_regime:
-        tg_lines.append("• 현재 유의미한 국면 차별화 시그널 없음")
+        tg_lines.append("• 현재 유의미한 국면 차별화 시그널이 없습니다.")
 
-    # 4) 3대 파생지표 해설, 연구 한계, 용어 사전 첨부
+    # 4) 상세 리포트 부록 및 텔레그램 푸터
     md_lines.extend(["", DERIVATIVE_COMPARISON_GUIDE, RESEARCH_CAVEATS, "## 6. 핵심 용어 사전 (챗봇·초보자 참고용)"])
     for term, desc in GLOSSARY.items():
         md_lines.append(f"- **{term}:** {desc}")
 
-    tg_lines.append("━━━━━━━━━━━━━━━━━━━━")
-    tg_lines.append("※ 상세 5단계 해석법·주의사항: outputs/interpretation_report.md 참고")
+    tg_lines.extend([
+        "",
+        "────────────────────",
+        "검증 기준: 시장중립 5영업일, 왕복 거래비용 0.25% 차감",
+        "상세 해석 및 매뉴얼: outputs/interpretation_report.md",
+    ])
 
     md_path = OUTPUT_DIR / "interpretation_report.md"
     tg_path = OUTPUT_DIR / "telegram_brief.txt"

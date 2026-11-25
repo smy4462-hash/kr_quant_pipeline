@@ -44,3 +44,10 @@ jobs:
           git add kr_quant.db
           git diff --staged --quiet || git commit -m "chore(data): daily market & disclosure update"
           git push
+
+      - name: 6. 일간 실시간 시그널 텔레그램 알림
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python notifiers/daily_alert.py --days 1
