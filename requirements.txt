@@ -5,3 +5,7 @@ scipy
 plotly
 requests
 python-dotenv
+duckdb
+pyarrow
+yfinance
+huggingface_hub

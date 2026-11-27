@@ -1,8 +1,8 @@
-name: Daily Data Ingestion (Stock + DART + Sentiment)
+name: Daily Data Ingestion & Alert (v2 Data Lake)
 
 on:
   schedule:
-    # 평일(월~금) 한국시간 저녁 8:00 (UTC 11:00) — 장 마감 및 장후 공시 완료 후
+    # 평일(월~금) 한국시간 저녁 8:00 (UTC 11:00)
     - cron: '0 11 * * 1-5'
   workflow_dispatch:
 
@@ -10,8 +10,9 @@ permissions:
   contents: write
 
 jobs:
-  daily-ingest:
+  daily-ingest-v2:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: 1. 코드 불러오기
@@ -28,26 +29,40 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 4. 일간 증분 데이터 수집 (주가 · 공시 · 심리지표 · KRX 파생)
+      - name: 4. Hugging Face에서 v2 data_lake 내려받기
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python db/hf_sync.py --pull
+
+      - name: 5. 심리지표 및 국내·미국 주가·국내 전 종목 공시 증분 수집
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: |
-          python main.py --mode all --days 5
+          python main.py --mode krx --days 5
           python collectors/sentiment_collector.py --days 2000
           python collectors/krx_deriv_collector.py
+          python db/hf_sync.py --sync-sentiment
+          python collectors/v2_market_collector.py --market ALL --days 5
+          python collectors/v2_dart_collector.py --days 5
 
-      - name: 5. DB 변경사항 자동 저장 (Commit & Push)
+      - name: 6. 갱신된 data_lake를 Hugging Face로 업로드
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python db/hf_sync.py --push --message "chore(daily): sync v2 data_lake"
+
+      - name: 7. v2 전 종목 일간 텔레그램 경보 발송 (상위 5건 요약 + 전체 CSV 첨부)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python notifiers/v2_daily_alert.py --days 1
+
+      - name: 8. 심리지표 기준 DB(kr_quant.db) 변경사항 커밋
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git add kr_quant.db
-          git diff --staged --quiet || git commit -m "chore(data): daily market & disclosure update"
+          git diff --staged --quiet || git commit -m "chore(data): daily v2 sentiment & krx base update"
           git push
-
-      - name: 6. 일간 실시간 시그널 텔레그램 알림
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python notifiers/daily_alert.py --days 1

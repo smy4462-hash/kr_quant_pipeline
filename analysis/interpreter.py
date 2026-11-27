@@ -210,9 +210,12 @@ def diagnose_regime_row(row: pd.Series, total_tests: int) -> dict:
     if pd.notna(p_diff) and p_diff < 0.05 and fear_ret <= -1.0:
         tg_role = "강력 회피 권고"
         md_action = "공포 국면 강력 회피 필터 적용을 권고합니다."
-    elif pd.notna(p_diff) and p_diff < 0.05 and fear_ret >= 1.0:
+    elif pd.notna(p_diff) and p_diff < 0.05 and fear_ret >= 1.0 and fear_win >= 50.0:
         tg_role = "기회형 매수 후보"
         md_action = "공포 국면 기회형 매수 후보로 검토할 수 있습니다."
+    elif pd.notna(p_diff) and p_diff < 0.05 and fear_ret >= 1.0 and fear_win < 50.0:
+        tg_role = "우측 꼬리 이상치 주의"
+        md_action = "평균 수익률은 양수이나 승률이 50% 미만으로 소수 급등주에 의한 왜곡이 확인되어 매수 후보에서 제외합니다."
     else:
         tg_role = "유의미한 차별화 없음"
         md_action = "공포 국면과 평온 국면 간 통계적으로 유의미한 차별화가 없습니다."
@@ -373,7 +376,7 @@ def generate_reports():
                 f"  * 판정 요약: {diag['action']}",
             ])
 
-            if diag["is_strong"]:
+            if diag["is_strong"] and diag["tg_role"] != "우측 꼬리 이상치 주의":
                 found_any_regime = True
                 tg_lines.append(f"• {clean_ev} | {clean_ind} 공포 시 {diag['tg_role']}")
                 tg_lines.append(

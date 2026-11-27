@@ -1,8 +1,8 @@
-name: Weekly Quant Analysis & Report
+name: Weekly Analysis & Report (v2 Data Lake)
 
 on:
   schedule:
-    # 매주 월요일 한국시간 오전 8:30 (UTC 일요일 23:30) — 주간 장 시작 전 리포트 완성
+    # 매주 월요일 한국시간 오전 8:30 (일요일 UTC 23:30)
     - cron: '30 23 * * 0'
   workflow_dispatch:
 
@@ -10,8 +10,9 @@ permissions:
   contents: write
 
 jobs:
-  weekly-analysis:
+  weekly-analysis-v2:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: 1. 코드 불러오기
@@ -28,32 +29,40 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 4. 주간 누락 보정 수집 (최근 10일 + KRX 파생)
+      - name: 4. Hugging Face에서 v2 data_lake 내려받기
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python db/hf_sync.py --pull
+
+      - name: 5. 최근 10일 누락 보정 수집 (주가 · 국내 공시 · 심리지표)
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: |
-          python main.py --mode all --days 10
+          python main.py --mode krx --days 10
           python collectors/sentiment_collector.py --days 2000
           python collectors/krx_deriv_collector.py
+          python db/hf_sync.py --sync-sentiment
+          python collectors/v2_market_collector.py --market ALL --days 10
+          python collectors/v2_dart_collector.py --days 10
 
-      - name: 5. 이벤트 스터디 · 국면 분석 · 자동 해석 리포트 생성
-        run: |
-          python analysis/event_study.py
-          python analysis/regime_event_study.py
-          python analysis/interpreter.py
+      - name: 6. 보정된 data_lake를 Hugging Face로 업로드
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python db/hf_sync.py --push --message "chore(weekly): sync v2 data_lake"
 
-      - name: 6. 최신 DB 및 분석 산출물(CSV/HTML/리포트) 자동 저장
-        run: |
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add kr_quant.db outputs/
-          git diff --staged --quiet || git commit -m "chore(report): weekly quant analysis & auto-interpretation"
-          git push
-
-      - name: 7. 텔레그램 주간 브리핑 자동 발송
+      - name: 7. v2 전 종목 통계 분석 및 텔레그램 주간 브리핑 발송
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python analysis/v2_analysis.py --send-telegram --attach-report
+
+      - name: 8. 주간 리포트 산출물(outputs/v2/) 및 기준 DB 커밋
         run: |
-          python notifiers/telegram_bot.py --attach-report
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add kr_quant.db outputs/v2/
+          git diff --staged --quiet || git commit -m "chore(report): weekly v2 full-market analysis & report"
+          git push
